@@ -1,8 +1,9 @@
 use crate::metrics::Metrics;
 use crate::security::SecurityLayer;
+use arc_swap::ArcSwap; // NEW: Required for Hot Reload
 use async_trait::async_trait;
 use bytes::Bytes;
-use pingora::http::ResponseHeader; // <--- ADDED IMPORT
+use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +17,8 @@ pub struct RequestCtx {
 
 pub struct SecureProxy {
     pub lb: Arc<LoadBalancer<RoundRobin>>,
-    pub security: Arc<SecurityLayer>,
+    // CHANGED: Wrapped in ArcSwap to allow swapping config while running
+    pub security: Arc<ArcSwap<SecurityLayer>>,
     pub metrics: Arc<Metrics>,
     pub upstream_sni: String,
 }
@@ -42,7 +44,8 @@ impl ProxyHttp for SecureProxy {
         ctx.path = path.clone();
         ctx.method = method.clone();
 
-        // 1. Intercept /metrics endpoint
+        // --- 1. Internal Metrics Endpoint Interception ---
+        // We handle /metrics requests directly here; they never go to the upstream.
         if path == "/metrics" && method == "GET" {
             let body = self
                 .metrics
@@ -54,18 +57,22 @@ impl ProxyHttp for SecureProxy {
                     )
                 })?
                 .into_bytes();
+
             let mut header = ResponseHeader::build(200, Some(4)).map_err(|e| {
                 pingora::Error::explain(
                     pingora::ErrorType::InternalError,
                     format!("response header build: {}", e),
                 )
             })?;
-            header.insert_header("Content-Type", "text/plain").map_err(|e| {
-                pingora::Error::explain(
-                    pingora::ErrorType::InternalError,
-                    format!("insert header: {}", e),
-                )
-            })?;
+
+            header
+                .insert_header("Content-Type", "text/plain")
+                .map_err(|e| {
+                    pingora::Error::explain(
+                        pingora::ErrorType::InternalError,
+                        format!("insert header: {}", e),
+                    )
+                })?;
 
             session
                 .write_response_header(Box::new(header), false)
@@ -74,10 +81,14 @@ impl ProxyHttp for SecureProxy {
                 .write_response_body(Some(Bytes::from(body)), true)
                 .await?;
 
-            return Ok(true); // Stop processing, request handled
+            return Ok(true); // Stop processing, request handled internally
         }
 
-        // 2. Security Checks
+        // --- 2. Security Checks (Hot Reloadable) ---
+        // Load the current security configuration snapshot.
+        // If config changed, this instantly gets the new rules.
+        let security_snapshot = self.security.load();
+
         let user_agent = session.get_header("User-Agent").map(|v| v.as_bytes());
         let auth_header = session.get_header("Authorization").map(|v| v.as_bytes());
         let client_ip = session
@@ -85,32 +96,35 @@ impl ProxyHttp for SecureProxy {
             .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        if let Err(code) = self.security.check_rate_limit(&client_ip) {
+        // Check Rate Limit
+        if let Err(code) = security_snapshot.check_rate_limit(&client_ip) {
             tracing::warn!(client_ip = %client_ip, "rate limit exceeded");
             session.respond_error(code).await?;
             return Ok(true);
         }
 
-        if let Err(code) = self.security.check_path(path_bytes) {
+        // Check Blocked Paths
+        if let Err(code) = security_snapshot.check_path(path_bytes) {
             tracing::warn!(path = %path, "blocked path");
             session.respond_error(code).await?;
             return Ok(true);
         }
 
-        if let Err(code) = self.security.check_user_agent(user_agent) {
+        // Check Bot / User Agent
+        if let Err(code) = security_snapshot.check_user_agent(user_agent) {
             tracing::warn!(client_ip = %client_ip, "blocked user agent");
             session.respond_error(code).await?;
             return Ok(true);
         }
 
-        // 3. JWT Authentication (The Bouncer)
-        if let Err(code) = self.security.check_jwt(auth_header) {
+        // Check JWT Authentication
+        if let Err(code) = security_snapshot.check_jwt(auth_header) {
             tracing::warn!(client_ip = %client_ip, "jwt auth failed");
             session.respond_error(code).await?;
             return Ok(true);
         }
 
-        Ok(false)
+        Ok(false) // Passed all checks, forward to upstream
     }
 
     async fn upstream_peer(
@@ -122,6 +136,7 @@ impl ProxyHttp for SecureProxy {
             pingora::Error::explain(pingora::ErrorType::InternalError, "no healthy upstream")
         })?;
 
+        // TLS is set to 'true'. Change to 'false' if testing with local HTTP servers.
         let peer = Box::new(HttpPeer::new(upstream, true, self.upstream_sni.clone()));
         Ok(peer)
     }
@@ -132,11 +147,9 @@ impl ProxyHttp for SecureProxy {
         upstream_request: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        upstream_request
-            .insert_header("Host", self.upstream_sni.as_str())
-            .map_err(|e| {
-                pingora::Error::explain(pingora::ErrorType::InternalError, e.to_string())
-            })?;
+        // FIX: Force Host header to match SNI.
+        // This solves the 502 error when using strict cloud providers (e.g., Cloudflare).
+        upstream_request.insert_header("Host", &self.upstream_sni)?;
         Ok(())
     }
 
@@ -146,7 +159,10 @@ impl ProxyHttp for SecureProxy {
         upstream_response: &mut pingora::http::ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        self.security.inject_security_headers(upstream_response);
+        // We load the snapshot again to ensure we use the latest header config
+        self.security
+            .load()
+            .inject_security_headers(upstream_response);
         Ok(())
     }
 
@@ -167,10 +183,11 @@ impl ProxyHttp for SecureProxy {
             .map(|r| r.status.as_u16())
             .unwrap_or(0);
 
-        // Record metrics
+        // Record the metrics for Prometheus
         self.metrics
             .record_request(status_code, &ctx.method, &ctx.path, duration);
 
+        // Structured logging
         tracing::info!(
             client_ip = %client_ip,
             method = %ctx.method,

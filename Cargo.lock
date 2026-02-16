@@ -1976,6 +1976,7 @@ dependencies = [
 name = "reverse-proxy"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bytes",
  "clap 4.5.58",
